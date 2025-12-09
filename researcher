@@ -3,64 +3,22 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-# ==============================================================================
-# CODEX RESEARCHER - Autonomous Research Paper Pipeline
-# Refines a Markdown file into a professional research paper using Codex CLI.
-# ==============================================================================
-
-VERSION="2.3.0"
-BACKUP_DIR=".research_backups"
-
-# Defaults
+VERSION="2.4.0"
 TARGET_FILE="project.md"
 INSTRUCTION_FILE=""
 GOAL=""
-MAX_ITERATIONS=10
-ITERATION_DELAY=2
+ITERATIONS=6
+DELAY=2
 DRY_RUN=false
-MODEL_FLAG="" 
-NO_CHANGE_THRESHOLD=2
-MAX_DURATION=""
-MAX_COST=""
-PRICE_PER_1K=""
+MODEL_FLAG=""
 SANDBOX_MODE="workspace-write"
 APPROVAL_POLICY="on-failure"
-
-SUCCESSFUL_ITERATIONS=0
-ERROR_STREAK=0
-TOTAL_TOKENS=0
-TOTAL_COST="0"
-
 NOTES_FILE="shared_task_notes.md"
-ENABLE_COMMITS=true
-GIT_BRANCH_PREFIX="researcher/"
-MERGE_STRATEGY="squash"
-GITHUB_OWNER=""
-GITHUB_REPO=""
-WORKTREE_NAME=""
-WORKTREE_BASE_DIR="../researcher-worktrees"
-CLEANUP_WORKTREE=false
-LIST_WORKTREES=false
-MAIN_BRANCH=""
-
-# ------------------------------------------------------------------------------
-# PROMPTS & PERSONAS
-# ------------------------------------------------------------------------------
-
-# The Core Persona
-SYSTEM_CONTEXT="You are a Senior Principal Researcher at a top-tier institute. 
-Your goal is to transform the project rooted at '{TARGET_FILE}' into a rigorous research paper.
-- Strictly use LaTeX for math (e.g., $\int f(x) dx$).
-- Use standard Markdown headers.
-- NO conversational filler. DO NOT say 'Here is the code'.
-- The project may be a single Markdown file or a directory of numbered Markdown section files (e.g., 1_abstract.md, 2_introduction.md, ...).
-- EDIT only the files under '{TARGET_FILE}' (create/update numbered section files when appropriate). Do not write back into a single large monolithic file.
-- Always persist your edits by writing to the Markdown files on disk using shell commands; do not just print revised content to stdout.
-- Never modify files outside the project root. Do not run package managers or system-level commands; limit shell usage to viewing and editing project files.
-- Maintain a concise status/notes file 'shared_task_notes.md' across iterations as instructed.
-- Do not output file contents to stdout unless requested.
-- When reviewing any section file, read and reason about its entire contents (not only the first few lines), even if the file is long; ensure edits remain globally consistent with the whole document.
-- Avoid excessive markdown structure; prefer fluent textbook or research-paper English prose instead of many bullet points."
+PROJECT_TYPE="markdown"
+LATEX_MAIN=""
+LATEX_FILES=()
+LATEX_SEEN=""
+PATH_RESOLVER=""
 
 PROMPT_INIT="Generate a comprehensive outline and write the initial Abstract and Introduction based on the goal. Ensure standard academic structure."
 PROMPT_EXPANSION="Review the target file. Identify sections that are brief. Expand them with theoretical context and simulated citations. Identify and draft new sections that can make the paper better, correlated applications or further developments."
@@ -68,91 +26,54 @@ PROMPT_MATHEMATIZE="Review the target file. Convert plain text logic into rigoro
 PROMPT_CRITIQUE="Act as 'Reviewer #2'. Harshly critique logic/flow in the target file. Remove redundancy and fix weak arguments."
 PROMPT_POLISH="Final Polish. Check for academic tone, consistency, and formatting. Ensure structure: Abstract, Intro, Related Work, Methodology, Results, Conclusion."
 
-# ------------------------------------------------------------------------------
-# HELPER FUNCTIONS
-# ------------------------------------------------------------------------------
+PROMPT_INIT_OVERRIDE=""
+PROMPT_EXPANSION_OVERRIDE=""
+PROMPT_MATHEMATIZE_OVERRIDE=""
+PROMPT_CRITIQUE_OVERRIDE=""
+PROMPT_POLISH_OVERRIDE=""
 
-show_help() {
-    cat << EOF
-Codex Researcher (v$VERSION)
+SYSTEM_CONTEXT="You are a Senior Principal Researcher at a top-tier institute.\nYour goal is to transform the project rooted at '{TARGET_FILE}' into a rigorous research paper.\n- Strictly use LaTeX for math (e.g., $\\int f(x) dx$).\n- Use standard Markdown headers.\n- NO conversational filler. DO NOT say 'Here is the code'.\n- Maintain a concise status/notes file 'shared_task_notes.md' across iterations as instructed.\n- Do not output file contents to stdout unless requested.\n- When reviewing any section file, read and reason about its entire contents.\n- When working on a LaTeX project, inspect the main file's \\input/\\include graph and edit each referenced .tex file in place.\n- Avoid excessive markdown structure and prefer fluent textbook or research-paper English prose."
 
-USAGE:
-    $(basename "$0") --goal "Topic" [options]
+log_info() { printf '[INFO] %s\n' "$1"; }
+log_warn() { printf '[WARN] %s\n' "$1"; }
+log_err() { printf '[ERROR] %s\n' "$1"; }
+log_success() { printf '[SUCCESS] %s\n' "$1"; }
 
-REQUIRED:
-    -g, --goal <text>         The specific research goal (unless -i is used).
-
-OPTIONS:
-    -f, --file <path>           Target markdown file (default: project.md)
-    -i, --instructions <path>   Path to a text file containing detailed instructions/goals.
-    -n, --iterations <num>      Number of refinement loops (default: 10)
-    -d, --delay <seconds>       Delay (in seconds) between iterations (default: 2)
-    --no-change-threshold <n>   Stop early after N iterations with no changes (default: 2)
-    --max-duration <duration>   Maximum wall-clock duration (e.g., 30m, 2h, 1h30m)
-    --max-cost <dollars>        Maximum approximate USD budget (requires --price-per-1k)
-    --price-per-1k <dollars>    Price in USD per 1000 tokens for cost estimation
-    --notes-file <file>         Shared notes/status file (default: shared_task_notes.md)
-    --disable-commits           Disable automatic git commits and PRs
-    --git-branch-prefix <p>     Branch prefix for iterations (default: "researcher/")
-    --merge-strategy <s>        PR merge strategy: squash, merge, or rebase (default: "squash")
-    --owner <owner>             GitHub repository owner (auto-detected from git remote)
-    --repo <repo>               GitHub repository name (auto-detected from git remote)
-    --worktree <name>           Run in a git worktree (creates if needed)
-    --worktree-base-dir <dir>   Base directory for worktrees (default: "../researcher-worktrees")
-    --cleanup-worktree          Remove worktree after completion
-    --list-worktrees            List all active git worktrees and exit
-    -m, --model <name>          Specify model (e.g., o1, claude-3-5-sonnet)
-    -S, --sandbox <mode>        Codex sandbox policy (read-only, workspace-write, danger-full-access)
-    -A, --approval <policy>     Approval policy (untrusted, on-failure, on-request, never)
-    --dry-run                   Show prompts/commands but do not execute Codex
-    -h, --help                  Show this help message
-
-EXAMPLE:
-    $(basename "$0") -g "Byzantine Fault Tolerance" -f paper.md -n 5
-EOF
-}
-
-log_info() { echo -e "\033[1;34m[INFO]\033[0m $1"; }
-log_success() { echo -e "\033[1;32m[SUCCESS]\033[0m $1"; }
-log_warn() { echo -e "\033[1;33m[WARN]\033[0m $1"; }
-log_err() { echo -e "\033[1;31m[ERROR]\033[0m $1"; }
-
-create_backup() {
-    local timestamp
-    timestamp=$(date +%Y%m%d_%H%M%S)
-    local filename
-    filename=$(basename "$TARGET_FILE")
-    mkdir -p "$BACKUP_DIR"
-    if [ -d "$TARGET_FILE" ]; then
-        # Backup the entire project directory
-        if ! cp -R "$TARGET_FILE" "$BACKUP_DIR/${filename}_${timestamp}"; then
-            log_err "Failed to create directory backup in '$BACKUP_DIR'. Check permissions."
-            exit 1
-        fi
+detect_path_resolver() {
+    if command -v python3 >/dev/null 2>&1; then
+        PATH_RESOLVER="python3"
+    elif command -v python >/dev/null 2>&1; then
+        PATH_RESOLVER="python"
+    elif command -v perl >/dev/null 2>&1; then
+        PATH_RESOLVER="perl"
     else
-        if ! cp "$TARGET_FILE" "$BACKUP_DIR/${filename}_${timestamp}.bak"; then
-            log_err "Failed to create backup in '$BACKUP_DIR'. Check permissions."
-            exit 1
-        fi
+        PATH_RESOLVER=""
     fi
 }
 
-compute_target_hash() {
-    if [ ! -f "$TARGET_FILE" ]; then
-        return 1
+normalize_path() {
+    local target="$1"
+    if [ -z "$target" ]; then
+        printf ''
+        return
     fi
-
-    if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum "$TARGET_FILE" 2>/dev/null | awk '{print $1}'
-    elif command -v shasum >/dev/null 2>&1; then
-        shasum "$TARGET_FILE" 2>/dev/null | awk '{print $1}'
-    elif command -v md5sum >/dev/null 2>&1; then
-        md5sum "$TARGET_FILE" 2>/dev/null | awk '{print $1}'
-    else
-        # Fallback: use file size as a coarse proxy
-        wc -c < "$TARGET_FILE" 2>/dev/null | awk '{print "bytes:"$1}'
-    fi
+    case "$PATH_RESOLVER" in
+        python3|python)
+            "$PATH_RESOLVER" - "$target" <<'PY'
+import os, sys
+print(os.path.normpath(os.path.abspath(sys.argv[1])))
+PY
+            ;;
+        perl)
+            perl -MCwd -e 'print Cwd::abs_path($ARGV[0])' "$target"
+            ;;
+        *)
+            printf '%s' "$target"
+            ;;
+    esac
 }
+
+detect_path_resolver
 
 split_markdown_into_sections() {
     local source_file="$1"
@@ -164,79 +85,112 @@ split_markdown_into_sections() {
 
     mkdir -p "$dest_dir"
 
-    if ! command -v awk >/dev/null 2>&1; then
-        # Fallback: single-section file
-        cp "$source_file" "$dest_dir/1_section.md"
+    awk -v outdir="$dest_dir" '\n    function open_section(raw_title) {\n        section++\n        slug = raw_title\n        gsub(/^[#[:space:]]+/, "", slug)\n        gsub(/[^A-Za-z0-9]+/, "_", slug)\n        gsub(/^_+|_+$/, "", slug)\n        if (slug == "") slug = "section"\n        filename = sprintf("%s/%d_%s.md", outdir, section, tolower(slug))\n        close(current)\n        current = filename\n        print "" > current\n    }\n    BEGIN { section = 0; current = "" }\n    {\n        if ($0 ~ /^# /) {\n            open_section($0)\n        } else if (section == 0) {\n            open_section("section")\n        }\n        print $0 >> current\n    }\n    END {\n        if (section == 0) {\n            current = sprintf("%s/1_section.md", outdir)\n            print "" > current\n        }\n    }\n    ' "$source_file"
+}
+
+collect_latex_files() {
+    local file="$1"
+    if [ -z "$file" ]; then
         return 0
     fi
+    if printf '%s\n' "$LATEX_SEEN" | grep -Fxq "$file"; then
+        return 0
+    fi
+    LATEX_SEEN="${LATEX_SEEN}${file}"$'\n'
+    LATEX_FILES+=("$file")
 
-    awk -v outdir="$dest_dir" '
-    function open_section(raw_title) {
-        section++
-        slug = raw_title
-        gsub(/^[#[:space:]]+/, "", slug)
-        gsub(/[^A-Za-z0-9]+/, "_", slug)
-        gsub(/^_+|_+$/, "", slug)
-        if (slug == "") slug = "section"
-        filename = sprintf("%s/%d_%s.md", outdir, section, tolower(slug))
-        close(current)
-        current = filename
-        print "" > current
-    }
-    BEGIN { section = 0; current = "" }
-    {
-        if ($0 ~ /^# /) {
-            open_section($0)
-        } else if (section == 0) {
-            open_section("section")
-        }
-        print $0 >> current
-    }
-    END {
-        if (section == 0) {
-            current = sprintf("%s/1_section.md", outdir)
-            print "" > current
-        }
-    }
-    ' "$source_file"
+    local dir
+    dir=$(dirname "$file")
+    local matches
+    matches=$(perl -ne 's/%.*//; while (/(?:\\input|\\include)\s*\{([^}]+)\}/g) {print "$1\n"}' "$file")
+
+    local relpath
+    while IFS= read -r relpath; do
+        relpath=$(printf '%s' "$relpath" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        if [ -z "$relpath" ]; then
+            continue
+        fi
+
+        local candidate="$relpath"
+        local base
+        base=$(basename "$candidate")
+        local ext=""
+        if [[ "$base" == *.* ]]; then
+            ext="${base##*.}"
+        fi
+        if [ -z "$ext" ]; then
+            candidate="${candidate}.tex"
+            ext="tex"
+        fi
+        if [ "$ext" != "tex" ]; then
+            continue
+        fi
+
+        local candidate_path="$candidate"
+        if [[ "$candidate_path" != /* ]]; then
+            candidate_path="$dir/$candidate_path"
+        fi
+
+        local resolved
+        resolved=$(normalize_path "$candidate_path")
+        if [ -z "$resolved" ]; then
+            continue
+        fi
+
+        if [ -f "$resolved" ]; then
+            collect_latex_files "$resolved"
+        fi
+    done <<EOF
+$matches
+EOF
 }
 
 prepare_project_root() {
-    # If TARGET_FILE is already a directory, ensure it contains at least one markdown section.
     if [ -d "$TARGET_FILE" ]; then
+        PROJECT_TYPE="markdown"
         if ! find "$TARGET_FILE" -maxdepth 1 -type f -name "*.md" | grep -q .; then
             local first_section="$TARGET_FILE/1_introduction.md"
-            log_warn "No markdown sections found in '$TARGET_FILE'. Creating placeholder section '$first_section'..."
-            {
-                echo "# Research Project"
-                echo ""
-                echo "Goal: $GOAL"
-            } > "$first_section"
+            log_warn "No markdown sections found in '$TARGET_FILE'. Creating placeholder '$first_section'."
+            printf '# Research Project\n\nGoal: %s\n' "$GOAL" > "$first_section"
         fi
         return 0
     fi
 
-    # Otherwise, treat TARGET_FILE as a single-file entry point and build a multi-file project directory.
+    if [[ "$TARGET_FILE" == *.tex ]]; then
+        if [ ! -f "$TARGET_FILE" ]; then
+            log_err "LaTeX target '$TARGET_FILE' does not exist."
+            exit 1
+        fi
+        PROJECT_TYPE="latex"
+        LATEX_FILES=()
+        LATEX_SEEN=""
+        LATEX_MAIN=$(normalize_path "$TARGET_FILE")
+        collect_latex_files "$LATEX_MAIN"
+        if [ "${#LATEX_FILES[@]}" -eq 0 ]; then
+            log_warn "No LaTeX files were discovered in '$TARGET_FILE'."
+        fi
+        return 0
+    fi
+
+    PROJECT_TYPE="markdown"
     local base_dir
     base_dir=$(dirname "$TARGET_FILE")
     local base_name
     base_name=$(basename "$TARGET_FILE")
-    local name_no_ext="${base_name%.*}"
-    local project_dir="${base_dir}/${name_no_ext}"
+    local name_no_ext
+    name_no_ext="${base_name%.*}"
+    local project_dir
+    project_dir="${base_dir}/${name_no_ext}"
 
     if [ ! -d "$project_dir" ]; then
         mkdir -p "$project_dir"
         if [ -f "$TARGET_FILE" ]; then
-            log_info "Initializing multi-file project directory '$project_dir' from '$TARGET_FILE'."
+            log_info "Initializing '$project_dir' from '$TARGET_FILE'."
             split_markdown_into_sections "$TARGET_FILE" "$project_dir"
         else
             local first_section="$project_dir/1_introduction.md"
-            log_warn "$TARGET_FILE not found. Creating new project directory '$project_dir' with placeholder section."
-            {
-                echo "# Research Project"
-                echo ""
-                echo "Goal: $GOAL"
-            } > "$first_section"
+            log_warn "Target '$TARGET_FILE' missing. Creating placeholder '$first_section'."
+            printf '# Research Project\n\nGoal: %s\n' "$GOAL" > "$first_section"
         fi
     else
         log_info "Using existing project directory '$project_dir'."
@@ -245,890 +199,286 @@ prepare_project_root() {
     TARGET_FILE="$project_dir"
 }
 
-parse_duration() {
-    # Parse a duration string like "2h", "30m", "1h30m", "90s" into seconds.
-    # Returns seconds on stdout, or exits non-zero on error.
-    local duration_str="$1"
-
-    # Remove all whitespace
-    duration_str=$(echo "$duration_str" | tr -d '[:space:]')
-
-    if [ -z "$duration_str" ]; then
-        return 1
-    fi
-
-    local total_seconds=0
-    local remaining="$duration_str"
-
-    # Hours
-    if [[ "$remaining" =~ ([0-9]+)[hH] ]]; then
-        local hours="${BASH_REMATCH[1]}"
-        total_seconds=$((total_seconds + hours * 3600))
-        remaining="${remaining/${BASH_REMATCH[0]}/}"
-    fi
-
-    # Minutes
-    if [[ "$remaining" =~ ([0-9]+)[mM] ]]; then
-        local minutes="${BASH_REMATCH[1]}"
-        total_seconds=$((total_seconds + minutes * 60))
-        remaining="${remaining/${BASH_REMATCH[0]}/}"
-    fi
-
-    # Seconds
-    if [[ "$remaining" =~ ([0-9]+)[sS] ]]; then
-        local seconds="${BASH_REMATCH[1]}"
-        total_seconds=$((total_seconds + seconds))
-        remaining="${remaining/${BASH_REMATCH[0]}/}"
-    fi
-
-    # Any leftover characters mean invalid format
-    if [ -n "$remaining" ]; then
-        return 1
-    fi
-
-    # Must have parsed something
-    if [ "$total_seconds" -eq 0 ]; then
-        return 1
-    fi
-
-    echo "$total_seconds"
-    return 0
+apply_prompt_override() {
+    local stage="$1"
+    local content="$2"
+    case "$stage" in
+        init) PROMPT_INIT_OVERRIDE="$content" ;;
+        expansion) PROMPT_EXPANSION_OVERRIDE="$content" ;;
+        mathematize) PROMPT_MATHEMATIZE_OVERRIDE="$content" ;;
+        critique) PROMPT_CRITIQUE_OVERRIDE="$content" ;;
+        polish) PROMPT_POLISH_OVERRIDE="$content" ;;
+        *) log_err "Unknown prompt stage: $stage"; exit 1 ;;
+    esac
 }
 
-detect_github_repo() {
-    # Try to detect GitHub owner and repo from git remote `origin`
-    # Prints "owner repo" on success, returns non-zero on failure.
-    if ! git rev-parse --git-dir > /dev/null 2>&1; then
-        return 1
-    fi
-
-    local remote_url
-    if ! remote_url=$(git remote get-url origin 2>/dev/null); then
-        return 1
-    fi
-
-    local owner=""
-    local repo=""
-
-    if [[ "$remote_url" =~ ^https://github\.com/([^/]+)/([^/]+)$ ]]; then
-        owner="${BASH_REMATCH[1]}"
-        repo="${BASH_REMATCH[2]}"
-    elif [[ "$remote_url" =~ ^git@github\.com:([^/]+)/([^/]+)$ ]]; then
-        owner="${BASH_REMATCH[1]}"
-        repo="${BASH_REMATCH[2]}"
-    else
-        return 1
-    fi
-
-    repo="${repo%.git}"
-
-    if [ -z "$owner" ] || [ -z "$repo" ]; then
-        return 1
-    fi
-
-    echo "$owner $repo"
-    return 0
-}
-
-list_worktrees() {
-    if ! git rev-parse --git-dir > /dev/null 2>&1; then
-        log_err "Not in a git repository; cannot list worktrees."
+set_prompt_from_pair() {
+    local pair="$1"
+    if [[ "$pair" != *:* ]]; then
+        log_err "Prompt arguments must be in the form '<stage>:<content>'"
         exit 1
     fi
-
-    echo "Active Git Worktrees:"
-    echo ""
-    if ! git worktree list 2>/dev/null; then
-        log_err "Failed to list worktrees."
+    local stage="${pair%%:*}"
+    local content="${pair#*:}"
+    stage="$(echo "$stage" | tr '[:upper:]' '[:lower:]')"
+    if [ -z "$content" ]; then
+        log_err "Prompt for stage '$stage' cannot be empty."
         exit 1
     fi
-
-    exit 0
+    apply_prompt_override "$stage" "$content"
 }
 
-setup_worktree() {
-    if [ -z "$WORKTREE_NAME" ]; then
-        # No worktree requested; operate in current working directory.
-        return 0
-    fi
-
-    if ! git rev-parse --git-dir > /dev/null 2>&1; then
-        log_err "Worktrees require a git repository. Run inside a git repo or omit --worktree."
+set_prompt_from_file() {
+    local pair="$1"
+    if [[ "$pair" != *:* ]]; then
+        log_err "Prompt files must be in the form '<stage>:<path>'"
         exit 1
     fi
-
-    local main_repo_dir
-    main_repo_dir=$(git rev-parse --show-toplevel)
-    local worktree_path="${WORKTREE_BASE_DIR}/${WORKTREE_NAME}"
-
-    if [[ "$worktree_path" != /* ]]; then
-        worktree_path="${main_repo_dir}/${worktree_path}"
+    local stage="${pair%%:*}"
+    local path="${pair#*:}"
+    stage="$(echo "$stage" | tr '[:upper:]' '[:lower:]')"
+    if [ ! -f "$path" ]; then
+        log_err "Prompt file '$path' does not exist."
+        exit 1
     fi
+    local content
+    content=$(cat "$path")
+    apply_prompt_override "$stage" "$content"
+}
 
-    local current_branch
-    current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main")
+get_prompt_for_stage() {
+    local stage="$1"
+    case "$stage" in
+        init) printf '%s' "${PROMPT_INIT_OVERRIDE:-$PROMPT_INIT}" ;;
+        expansion) printf '%s' "${PROMPT_EXPANSION_OVERRIDE:-$PROMPT_EXPANSION}" ;;
+        mathematize) printf '%s' "${PROMPT_MATHEMATIZE_OVERRIDE:-$PROMPT_MATHEMATIZE}" ;;
+        critique) printf '%s' "${PROMPT_CRITIQUE_OVERRIDE:-$PROMPT_CRITIQUE}" ;;
+        polish) printf '%s' "${PROMPT_POLISH_OVERRIDE:-$PROMPT_POLISH}" ;;
+        *) log_err "Unsupported stage: $stage"; exit 1 ;;
+    esac
+}
 
-    if [ -d "$worktree_path" ]; then
-        log_info "Worktree '$WORKTREE_NAME' already exists at: $worktree_path"
-        log_info "Switching to existing worktree directory..."
-        if ! cd "$worktree_path"; then
-            log_err "Failed to change to worktree directory: $worktree_path"
-            exit 1
-        fi
-        log_info "Pulling latest changes from $current_branch..."
-        git pull origin "$current_branch" >/dev/null 2>&1 || log_warn "Failed to pull latest changes (continuing anyway)."
+read_notes_file() {
+    if [ -f "$NOTES_FILE" ]; then
+        cat "$NOTES_FILE"
     else
-        log_info "Creating worktree '$WORKTREE_NAME' at: $worktree_path"
-        local base_dir
-        base_dir=$(dirname "$worktree_path")
-        if [ ! -d "$base_dir" ]; then
-            mkdir -p "$base_dir" || {
-                log_err "Failed to create worktree base directory: $base_dir"
-                exit 1
-            }
-        fi
-        if ! git worktree add "$worktree_path" "$current_branch" >/dev/null 2>&1; then
-            log_err "Failed to create worktree."
-            exit 1
-        fi
-        if ! cd "$worktree_path"; then
-            log_err "Failed to change to worktree directory: $worktree_path"
-            exit 1
-        fi
-    fi
-
-    log_success "Worktree '$WORKTREE_NAME' ready at: $worktree_path"
-    return 0
-}
-
-cleanup_worktree() {
-    if [ -z "$WORKTREE_NAME" ] || [ "$CLEANUP_WORKTREE" = false ]; then
-        return 0
-    fi
-
-    if ! git rev-parse --git-dir > /dev/null 2>&1; then
-        return 0
-    fi
-
-    local main_repo_dir
-    main_repo_dir=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
-    local worktree_path="${WORKTREE_BASE_DIR}/${WORKTREE_NAME}"
-    if [ -n "$main_repo_dir" ] && [[ "$worktree_path" != /* ]]; then
-        worktree_path="${main_repo_dir}/${worktree_path}"
-    fi
-
-    echo ""
-    log_info "Cleaning up worktree '$WORKTREE_NAME'..."
-
-    # Move to the main repo before removing the worktree
-    if [ -n "$main_repo_dir" ]; then
-        cd "$main_repo_dir" 2>/dev/null || true
-    fi
-
-    if git worktree remove "$worktree_path" --force >/dev/null 2>&1; then
-        log_success "Worktree removed successfully."
-    else
-        log_warn "Failed to remove worktree automatically; you may need to clean up '$worktree_path' manually."
+        printf ''
     fi
 }
 
-get_iteration_display() {
-    local iteration_num="$1"
-    local max_iters="$2"
-    echo "(${iteration_num}/${max_iters})"
-}
+build_full_prompt() {
+    local stage="$1"
+    local stage_prompt
+    stage_prompt=$(get_prompt_for_stage "$stage")
 
-create_iteration_branch() {
-    local iteration_display="$1"
-    local iteration_num="$2"
-
-    if ! git rev-parse --git-dir > /dev/null 2>&1; then
-        return 1
-    fi
-
-    local current_branch
-    current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main")
-
-    if [[ "$current_branch" == ${GIT_BRANCH_PREFIX}* ]]; then
-        log_warn "$iteration_display Already on iteration branch: $current_branch"
-        if [ -n "$MAIN_BRANCH" ]; then
-            git checkout "$MAIN_BRANCH" >/dev/null 2>&1 || return 1
-            current_branch="$MAIN_BRANCH"
-        fi
-    fi
-
-    local date_str
-    date_str=$(date +%Y-%m-%d)
-
-    local random_hash
-    if command -v openssl >/dev/null 2>&1; then
-        random_hash=$(openssl rand -hex 4)
-    elif [ -r /dev/urandom ]; then
-        random_hash=$(LC_ALL=C tr -dc 'a-f0-9' < /dev/urandom | head -c 8)
-    else
-        random_hash=$(printf "%x" $(($(date +%s) % 100000000)))$(printf "%x" $$)
-        random_hash=${random_hash:0:8}
-    fi
-
-    local branch_name="${GIT_BRANCH_PREFIX}iteration-${iteration_num}/${date_str}-${random_hash}"
-
-    log_info "$iteration_display Creating branch: $branch_name"
-
-    if [ "$DRY_RUN" = true ]; then
-        log_info "$iteration_display (DRY RUN) Would create branch $branch_name"
-        echo "$branch_name"
-        return 0
-    fi
-
-    if ! git checkout -b "$branch_name" >/dev/null 2>&1; then
-        log_warn "$iteration_display Failed to create branch"
-        echo ""
-        return 1
-    fi
-
-    echo "$branch_name"
-    return 0
-}
-
-researcher_commit() {
-    local iteration_display="$1"
-    local branch_name="$2"
-    local main_branch="$3"
-
-    if [ -z "$branch_name" ] || [ -z "$main_branch" ]; then
-        return 0
-    fi
-
-    if ! git rev-parse --git-dir > /dev/null 2>&1; then
-        return 0
-    fi
-
-    local has_changes=false
-    if ! git diff --quiet || ! git diff --cached --quiet; then
-        has_changes=true
-    fi
-
-    if [ -n "$(git ls-files --others --exclude-standard)" ]; then
-        has_changes=true
-    fi
-
-    if [ "$has_changes" = false ]; then
-        log_info "$iteration_display No git changes detected; cleaning up branch."
-        if [ "$DRY_RUN" = true ]; then
-            return 0
-        fi
-        git checkout "$main_branch" >/dev/null 2>&1 || true
-        git branch -D "$branch_name" >/dev/null 2>&1 || true
-        return 0
-    fi
-
-    if [ "$DRY_RUN" = true ]; then
-        log_info "$iteration_display (DRY RUN) Would commit and open PR for branch: $branch_name"
-        return 0
-    fi
-
-    log_info "$iteration_display Committing changes on branch: $branch_name"
-
-    git add . >/dev/null 2>&1 || {
-        log_err "$iteration_display Failed to stage changes."
-        git checkout "$main_branch" >/dev/null 2>&1 || true
-        return 1
-    }
-
-    local commit_title="Researcher ${iteration_display} for '$TARGET_FILE'"
-    local commit_body="Automated Codex Researcher update for goal: $GOAL
-
-Target file: $TARGET_FILE
-"
-
-    if ! git commit -m "$commit_title" -m "$commit_body" >/dev/null 2>&1; then
-        log_err "$iteration_display Failed to commit changes."
-        git checkout "$main_branch" >/dev/null 2>&1 || true
-        return 1
-    fi
-
-    log_info "$iteration_display Pushing branch to origin..."
-    if ! git push -u origin "$branch_name" >/dev/null 2>&1; then
-        log_err "$iteration_display Failed to push branch."
-        git checkout "$main_branch" >/dev/null 2>&1 || true
-        return 1
-    fi
-
-    if [ "$ENABLE_COMMITS" = true ] && command -v gh >/dev/null 2>&1 && [ -n "$GITHUB_OWNER" ] && [ -n "$GITHUB_REPO" ]; then
-        log_info "$iteration_display Creating pull request..."
-        if ! gh pr create --repo "$GITHUB_OWNER/$GITHUB_REPO" --title "$commit_title" --body "$commit_body" --base "$main_branch" >/dev/null 2>&1; then
-            log_warn "$iteration_display Failed to create PR; leaving branch '$branch_name' pushed."
-            git checkout "$main_branch" >/dev/null 2>&1 || true
-            return 0
-        fi
-
-        local merge_flag="--squash"
-        case "$MERGE_STRATEGY" in
-            merge) merge_flag="--merge" ;;
-            rebase) merge_flag="--rebase" ;;
-        esac
-
-        log_info "$iteration_display Merging PR for branch '$branch_name' with strategy: $MERGE_STRATEGY"
-        if ! gh pr merge "$branch_name" --repo "$GITHUB_OWNER/$GITHUB_REPO" $merge_flag --delete-branch --yes >/dev/null 2>&1; then
-            log_warn "$iteration_display Failed to merge PR automatically; it may require manual intervention."
-        fi
-    fi
-
-    git checkout "$main_branch" >/dev/null 2>&1 || true
-    git pull origin "$main_branch" >/dev/null 2>&1 || true
-
-    return 0
-}
-
-# ------------------------------------------------------------------------------
-# SIGNAL HANDLING (CTRL+C)
-# ------------------------------------------------------------------------------
-
-handle_interrupt() {
-    echo ""
-    log_warn "---------------------------------------------------"
-    log_warn "🛑 Process Interrupted by User (Ctrl+C)"
-    log_warn "---------------------------------------------------"
-    log_info "The pipeline has been stopped."
-    
-    if [ -d "$BACKUP_DIR" ]; then
-        # Find the most recent backup
-        local latest_backup=$(ls -t "$BACKUP_DIR" | head -n1)
-        if [ -n "$latest_backup" ]; then
-            log_info "Latest stable version saved at: $BACKUP_DIR/$latest_backup"
-            log_info "If '$TARGET_FILE' is corrupted, restore that backup."
-        fi
-    fi
-    
-    exit 130
-}
-
-# Trap SIGINT (Ctrl+C)
-trap handle_interrupt SIGINT
-
-# ------------------------------------------------------------------------------
-# CORE EXECUTION
-# ------------------------------------------------------------------------------
-
-run_codex_iteration() {
-    local task_instruction="$1"
     local extra_context=""
-    
-    # Load instruction file content if provided
-    if [ -n "$INSTRUCTION_FILE" ] && [ -f "$INSTRUCTION_FILE" ]; then
+    if [ -n "$INSTRUCTION_FILE" ]; then
         extra_context=$(cat "$INSTRUCTION_FILE")
     fi
 
-    # Construct the Mega-Prompt
-    # We explicitly mention the target file again to ensure the agent focuses on it.
-    local full_prompt="$SYSTEM_CONTEXT
-
-TARGET FILE: $TARGET_FILE
-PRIMARY GOAL: $GOAL
-EXTRA CONTEXT: $extra_context
-
-CURRENT TASK: $task_instruction"
-
-    # Replace placeholder in system context with actual project root
-    full_prompt="${full_prompt//\{TARGET_FILE\}/$TARGET_FILE}"
-
-    # If the target is a directory, describe the multi-file layout.
-    if [ -d "$TARGET_FILE" ]; then
-        full_prompt="$full_prompt
-
-PROJECT LAYOUT:
-- Root directory: $TARGET_FILE
-- Each section is a numbered Markdown file: N_title.md (N = 1, 2, 3, ...).
-Guidelines:
-- Preserve and refine this multi-file structure.
-- When adding new sections, use the next available integer and a short descriptive slug (e.g., 3_related_work.md).
-- Keep each file focused on a coherent section.
-- When you change content, open and overwrite the appropriate section file(s) on disk so that the project directory stays the single source of truth."
-    fi
-
-    # Attach continuous workflow context and shared notes file instructions
+    local notes_content
+    notes_content=$(read_notes_file)
+    local notes_instruction=""
     if [ -n "$NOTES_FILE" ]; then
-        full_prompt="$full_prompt
-
-## CONTINUOUS WORKFLOW CONTEXT
-
-This is part of a continuous research loop where work happens incrementally across multiple iterations (human and AI). You do not need to complete the entire goal in one run; make solid progress, then leave clear notes for the next iteration.
-"
-
         if [ -f "$NOTES_FILE" ]; then
-            local notes_content
-            notes_content=$(cat "$NOTES_FILE")
-            full_prompt="$full_prompt
-## CONTEXT FROM PREVIOUS ITERATION
-
-The following is from $NOTES_FILE, maintained across iterations:
-
-$notes_content
-"
-        fi
-
-        full_prompt="$full_prompt
-## ITERATION NOTES
-
-"
-
-        if [ -f "$NOTES_FILE" ]; then
-            full_prompt="$full_prompt Update the \`$NOTES_FILE\` file with relevant context and instructions for the next iteration. Add new notes and remove outdated information so it stays concise and useful."
+            notes_instruction="Update '$NOTES_FILE' with concise instructions for the next iteration."
         else
-            full_prompt="$full_prompt Create a \`$NOTES_FILE\` file with relevant context and instructions for the next iteration."
+            notes_instruction="Create '$NOTES_FILE' with concise instructions for the next iteration."
         fi
-
-        full_prompt="$full_prompt
-
-The notes file should:
-- Contain relevant context and instructions for the next iteration
-- Stay concise and actionable (like a notes file, not a full report)
-- Help the next researcher understand what to do next
-
-It should NOT include:
-- Exhaustive lists of completed work or full reports
-- Information that can be rediscovered by inspecting the manuscript
-- Unnecessary implementation details.
-"
     fi
+
+    local prompt="$SYSTEM_CONTEXT\n\nTARGET FILE: $TARGET_FILE\nPRIMARY GOAL: $GOAL\n"
+    if [ -n "$extra_context" ]; then
+        prompt+="\nEXTRA CONTEXT:\n$extra_context\n"
+    fi
+    if [ -n "$notes_content" ]; then
+        prompt+="\nPREVIOUS NOTES:\n$notes_content\n"
+    fi
+    if [ -n "$notes_instruction" ]; then
+        prompt+="\n$notes_instruction\n"
+    fi
+    local layout_desc=""
+    if [ "$PROJECT_TYPE" = "latex" ]; then
+        layout_desc="PROJECT LAYOUT:\n- Type: LaTeX\n- Main file (resolved): $LATEX_MAIN\n- Included .tex files:"
+        for file in "${LATEX_FILES[@]}"; do
+            if [ "$file" = "$LATEX_MAIN" ]; then
+                layout_desc+="\n  * $file (main)"
+            else
+                layout_desc+="\n  * $file"
+            fi
+        done
+        layout_desc+="\n- Edit these files directly and keep the include hierarchy intact.\n"
+    else
+        layout_desc="PROJECT LAYOUT:\n- Type: Markdown\n- Root directory: $TARGET_FILE\n- Each numbered Markdown section file (e.g., 1_introduction.md) is the source of truth; edit them in place.\n"
+    fi
+    prompt+="$layout_desc\n"
+    prompt+="\nCURRENT TASK: $stage_prompt\n"
+    printf '%s' "$prompt"
+}
+
+run_codex_iteration() {
+    local stage="$1"
+    local full_prompt
+    full_prompt=$(build_full_prompt "$stage")
 
     if [ "$DRY_RUN" = true ]; then
-        log_info "DRY RUN: Prompt Construction:"
-        echo "---------------------------------------------------"
-        echo -e "$full_prompt"
-        echo "---------------------------------------------------"
-        log_info "Command would be: echo \"...\" | codex --full-auto exec"
+        log_info "DRY RUN: would execute stage '$stage' with prompt:"
+        printf '-----\n%s\n-----\n' "$full_prompt"
         return 0
     fi
 
-    log_info "Executing Codex..."
-
-    # -------------------------------------------------------
-    # CODEX CLI INVOCATION
-    # We pipe the prompt to stdin to avoid argument parsing errors.
-    # -------------------------------------------------------
-    
-    # Build options array: run Codex in a sandboxed, workspace-write mode.
-    # We intentionally DO NOT bypass Codex's sandbox or approval mechanisms.
-    local GLOBAL_ARGS=("-s" "$SANDBOX_MODE")
-
+    log_info "Running stage '$stage'..."
+    local args=("-s" "$SANDBOX_MODE" "exec" "--full-auto")
     if [ -n "$APPROVAL_POLICY" ]; then
-        GLOBAL_ARGS+=("-a" "$APPROVAL_POLICY")
+        args+=("-a" "$APPROVAL_POLICY")
     fi
-
     if [ -n "$MODEL_FLAG" ]; then
-        GLOBAL_ARGS+=("-m" "$MODEL_FLAG")
+        args+=("-m" "$MODEL_FLAG")
     fi
 
-    local ARGS=("${GLOBAL_ARGS[@]}" "exec" "--full-auto")
-
-    local exit_code=0
-
-    # When tracking cost, run Codex with JSON output and capture token usage.
-    if [ -n "$MAX_COST" ] || [ -n "$PRICE_PER_1K" ]; then
-        local tmp_output
-        tmp_output=$(mktemp)
-        if ! echo "$full_prompt" | codex "${ARGS[@]}" --experimental-json >"$tmp_output"; then
-            exit_code=$?
-        else
-            exit_code=0
-        fi
-
-        if [ $exit_code -eq 0 ]; then
-            # Extract the latest total_tokens value from token_count events
-            local last_total_tokens
-            last_total_tokens=$(grep -o '"total_tokens":[0-9]*' "$tmp_output" 2>/dev/null | tail -n1 | sed 's/.*://') || true
-            if [ -n "$last_total_tokens" ] && [[ "$last_total_tokens" =~ ^[0-9]+$ ]]; then
-                TOTAL_TOKENS=$((TOTAL_TOKENS + last_total_tokens))
-                if [ -n "$PRICE_PER_1K" ]; then
-                    # Estimate cost for this iteration and accumulate
-                    local iter_cost
-                    iter_cost=$(awk -v t="$last_total_tokens" -v p="$PRICE_PER_1K" 'BEGIN { printf "%.6f", (t/1000.0)*p }')
-                    TOTAL_COST=$(awk -v c="$TOTAL_COST" -v i="$iter_cost" 'BEGIN { printf "%.6f", (c==""?0:c)+i }')
-                fi
-            fi
-        fi
-
-        rm -f "$tmp_output"
-    else
-        # Run by piping prompt into the command (no JSON capture)
-        if ! echo "$full_prompt" | codex "${ARGS[@]}"; then
-            exit_code=$?
-        else
-            exit_code=0
-        fi
-    fi
-
-    if [ $exit_code -eq 0 ]; then
-        return 0
-    else
-        # If exit code is 130, it was handled by the child process, 
-        # but our trap handles the main script logic.
-        if [ $exit_code -ne 130 ]; then
-            log_err "Codex exited with code $exit_code"
-        fi
+    if ! printf '%s' "$full_prompt" | codex "${args[@]}"; then
+        log_err "Codex failed for stage '$stage'."
         return 1
+    fi
+    return 0
+}
+
+select_stage_for_iteration() {
+    local iteration="$1"
+    local total="$2"
+    if [ "$iteration" -eq 1 ]; then
+        printf 'init'
+    elif [ "$iteration" -eq "$total" ]; then
+        printf 'polish'
+    elif (( iteration % 3 == 0 )); then
+        printf 'mathematize'
+    elif (( iteration % 4 == 0 )); then
+        printf 'critique'
+    else
+        printf 'expansion'
     fi
 }
 
-# ------------------------------------------------------------------------------
-# ARGUMENT PARSING
-# ------------------------------------------------------------------------------
+show_help() {
+    cat <<EOF
+Codex Researcher (v$VERSION)
+
+Usage: $0 --goal <text> [options]
+
+Required:
+  -g, --goal <text>            Research goal (unless --instructions is used)
+
+Options:
+  -f, --file <path>            Target Markdown file or directory (default: project.md)
+  -i, --instructions <path>    Extra instructions read from a file
+  -n, --iterations <num>       Iterations to run (default: 6)
+  -d, --delay <seconds>        Delay between iterations (default: 2)
+  --notes-file <path>          Shared notes file (default: shared_task_notes.md)
+  --model <name>               Model flag passed to codex (e.g., o1)
+  -S, --sandbox <mode>         Sandbox policy (read-only, workspace-write, danger-full-access)
+  -A, --approval <policy>      Approval policy (untrusted, on-failure, on-request, never)
+  --dry-run                    Show prompts but do not call codex
+  --prompt <stage>:<text>      Override a stage prompt inline (stage: init|expansion|mathematize|critique|polish)
+  --prompt-file <stage>:<path> Override a stage prompt using the contents of a file
+  -h, --help                   Show this message
+EOF
+}
 
 while [[ $# -gt 0 ]]; do
-    case $1 in
-        -h|--help) show_help; exit 0 ;;
+    case "$1" in
+        -h|--help) show_help; exit 0 ;; 
         -g|--goal)
-            if [[ $# -lt 2 ]]; then
-                log_err "Missing value for $1"
-                exit 1
-            fi
-            GOAL="$2"; shift 2 ;;
+            if [[ $# -lt 2 ]]; then log_err "Missing value for $1"; exit 1; fi
+            GOAL="$2"; shift 2 ;; 
         -f|--file)
-            if [[ $# -lt 2 ]]; then
-                log_err "Missing value for $1"
-                exit 1
-            fi
-            TARGET_FILE="$2"; shift 2 ;;
+            if [[ $# -lt 2 ]]; then log_err "Missing value for $1"; exit 1; fi
+            TARGET_FILE="$2"; shift 2 ;; 
         -i|--instructions)
-            if [[ $# -lt 2 ]]; then
-                log_err "Missing value for $1"
-                exit 1
-            fi
-            INSTRUCTION_FILE="$2"; shift 2 ;;
+            if [[ $# -lt 2 ]]; then log_err "Missing value for $1"; exit 1; fi
+            INSTRUCTION_FILE="$2"; shift 2 ;; 
         -n|--iterations)
-            if [[ $# -lt 2 ]]; then
-                log_err "Missing value for $1"
-                exit 1
-            fi
-            MAX_ITERATIONS="$2"; shift 2 ;;
+            if [[ $# -lt 2 ]]; then log_err "Missing value for $1"; exit 1; fi
+            ITERATIONS="$2"; shift 2 ;; 
         -d|--delay)
-            if [[ $# -lt 2 ]]; then
-                log_err "Missing value for $1"
-                exit 1
-            fi
-            ITERATION_DELAY="$2"; shift 2 ;;
-        --no-change-threshold)
-            if [[ $# -lt 2 ]]; then
-                log_err "Missing value for $1"
-                exit 1
-            fi
-            NO_CHANGE_THRESHOLD="$2"; shift 2 ;;
-        --max-duration)
-            if [[ $# -lt 2 ]]; then
-                log_err "Missing value for $1"
-                exit 1
-            fi
-            MAX_DURATION="$2"; shift 2 ;;
-        --max-cost)
-            if [[ $# -lt 2 ]]; then
-                log_err "Missing value for $1"
-                exit 1
-            fi
-            MAX_COST="$2"; shift 2 ;;
-        --price-per-1k)
-            if [[ $# -lt 2 ]]; then
-                log_err "Missing value for $1"
-                exit 1
-            fi
-            PRICE_PER_1K="$2"; shift 2 ;;
+            if [[ $# -lt 2 ]]; then log_err "Missing value for $1"; exit 1; fi
+            DELAY="$2"; shift 2 ;; 
         --notes-file)
-            if [[ $# -lt 2 ]]; then
-                log_err "Missing value for $1"
-                exit 1
-            fi
-            NOTES_FILE="$2"; shift 2 ;;
-        --disable-commits)
-            ENABLE_COMMITS=false; shift ;;
-        --git-branch-prefix)
-            if [[ $# -lt 2 ]]; then
-                log_err "Missing value for $1"
-                exit 1
-            fi
-            GIT_BRANCH_PREFIX="$2"; shift 2 ;;
-        --merge-strategy)
-            if [[ $# -lt 2 ]]; then
-                log_err "Missing value for $1"
-                exit 1
-            fi
-            MERGE_STRATEGY="$2"; shift 2 ;;
-        --owner)
-            if [[ $# -lt 2 ]]; then
-                log_err "Missing value for $1"
-                exit 1
-            fi
-            GITHUB_OWNER="$2"; shift 2 ;;
-        --repo)
-            if [[ $# -lt 2 ]]; then
-                log_err "Missing value for $1"
-                exit 1
-            fi
-            GITHUB_REPO="$2"; shift 2 ;;
-        --worktree)
-            if [[ $# -lt 2 ]]; then
-                log_err "Missing value for $1"
-                exit 1
-            fi
-            WORKTREE_NAME="$2"; shift 2 ;;
-        --worktree-base-dir)
-            if [[ $# -lt 2 ]]; then
-                log_err "Missing value for $1"
-                exit 1
-            fi
-            WORKTREE_BASE_DIR="$2"; shift 2 ;;
-        --cleanup-worktree)
-            CLEANUP_WORKTREE=true; shift ;;
-        --list-worktrees)
-            LIST_WORKTREES=true; shift ;;
-        -m|--model)
-            if [[ $# -lt 2 ]]; then
-                log_err "Missing value for $1"
-                exit 1
-            fi
-            MODEL_FLAG="$2"; shift 2 ;;
+            if [[ $# -lt 2 ]]; then log_err "Missing value for $1"; exit 1; fi
+            NOTES_FILE="$2"; shift 2 ;; 
+        --dry-run)
+            DRY_RUN=true; shift ;; 
+        --model)
+            if [[ $# -lt 2 ]]; then log_err "Missing value for $1"; exit 1; fi
+            MODEL_FLAG="$2"; shift 2 ;; 
         -S|--sandbox)
-            if [[ $# -lt 2 ]]; then
-                log_err "Missing value for $1"
-                exit 1
-            fi
-            SANDBOX_MODE="$2"; shift 2 ;;
+            if [[ $# -lt 2 ]]; then log_err "Missing value for $1"; exit 1; fi
+            SANDBOX_MODE="$2"; shift 2 ;; 
         -A|--approval)
-            if [[ $# -lt 2 ]]; then
-                log_err "Missing value for $1"
-                exit 1
-            fi
-            APPROVAL_POLICY="$2"; shift 2 ;;
-        --dry-run) DRY_RUN=true; shift ;;
+            if [[ $# -lt 2 ]]; then log_err "Missing value for $1"; exit 1; fi
+            APPROVAL_POLICY="$2"; shift 2 ;; 
+        --prompt)
+            if [[ $# -lt 2 ]]; then log_err "Missing value for $1"; exit 1; fi
+            set_prompt_from_pair "$2"; shift 2 ;; 
+        --prompt-file)
+            if [[ $# -lt 2 ]]; then log_err "Missing value for $1"; exit 1; fi
+            set_prompt_from_file "$2"; shift 2 ;; 
         *)
-            log_err "Unknown option: $1"
-            show_help
-            exit 1
-            ;;
+            log_err "Unknown option: $1"; show_help; exit 1 ;; 
     esac
+
 done
 
-# Validation
 if [ -z "$GOAL" ] && [ -z "$INSTRUCTION_FILE" ]; then
-    log_err "You must provide a Goal (-g) OR an Instruction File (-i)."
+    log_err "You must supply a goal (-g) or an instructions file (-i)."
     show_help
     exit 1
 fi
 
 if [ -n "$INSTRUCTION_FILE" ] && [ ! -f "$INSTRUCTION_FILE" ]; then
-    log_err "Instruction file '$INSTRUCTION_FILE' does not exist."
+    log_err "Instruction file '$INSTRUCTION_FILE' not found."
     exit 1
 fi
 
-if ! [[ $MAX_ITERATIONS =~ ^[0-9]+$ ]] || [ "$MAX_ITERATIONS" -le 0 ]; then
-    log_err "Iterations must be a positive integer (got '$MAX_ITERATIONS')."
+if ! [[ "$ITERATIONS" =~ ^[0-9]+$ ]] || [ "$ITERATIONS" -le 0 ]; then
+    log_err "Iterations must be a positive integer."
     exit 1
 fi
 
-if ! [[ $ITERATION_DELAY =~ ^[0-9]+$ ]] || [ "$ITERATION_DELAY" -lt 0 ]; then
-    log_err "Delay must be a non-negative integer (got '$ITERATION_DELAY')."
-    exit 1
-fi
-
-if ! [[ $NO_CHANGE_THRESHOLD =~ ^[0-9]+$ ]] || [ "$NO_CHANGE_THRESHOLD" -le 0 ]; then
-    log_err "No-change threshold must be a positive integer (got '$NO_CHANGE_THRESHOLD')."
-    exit 1
-fi
-
-if [ -n "$MAX_DURATION" ]; then
-    PARSED_DURATION=$(parse_duration "$MAX_DURATION") || {
-        log_err "Max duration must be a valid duration (e.g., '2h', '30m', '1h30m', '90s')"
-        exit 1
-    }
-    MAX_DURATION="$PARSED_DURATION"
-fi
-
-if [ -n "$MAX_COST" ]; then
-    if ! [[ $MAX_COST =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-        log_err "Max cost must be a positive number (got '$MAX_COST')."
-        exit 1
-    fi
-fi
-
-if [ -n "$PRICE_PER_1K" ]; then
-    if ! [[ $PRICE_PER_1K =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-        log_err "Price per 1K tokens must be a positive number (got '$PRICE_PER_1K')."
-        exit 1
-    fi
-fi
-
-if [ -n "$MAX_COST" ] && [ -z "$PRICE_PER_1K" ]; then
-    log_err "Using --max-cost requires --price-per-1k to estimate cost from token usage."
+if ! [[ "$DELAY" =~ ^[0-9]+$ ]] || [ "$DELAY" -lt 0 ]; then
+    log_err "Delay must be a non-negative integer."
     exit 1
 fi
 
 case "$SANDBOX_MODE" in
-    read-only|workspace-write|danger-full-access) ;;
-    *)
-        log_err "Sandbox mode must be read-only, workspace-write, or danger-full-access (got '$SANDBOX_MODE')."
-        exit 1
-        ;;
+    read-only|workspace-write|danger-full-access) ;; 
+    *) log_err "Sandbox mode must be read-only, workspace-write, or danger-full-access."; exit 1 ;; 
 esac
-
 case "$APPROVAL_POLICY" in
-    untrusted|on-failure|on-request|never) ;;
-    *)
-        log_err "Approval policy must be untrusted, on-failure, on-request, or never (got '$APPROVAL_POLICY')."
-        exit 1
-        ;;
+    untrusted|on-failure|on-request|never) ;; 
+    *) log_err "Approval policy must be untrusted, on-failure, on-request, or never."; exit 1 ;; 
 esac
 
-if [ -n "$MERGE_STRATEGY" ]; then
-    if ! [[ "$MERGE_STRATEGY" =~ ^(squash|merge|rebase)$ ]]; then
-        log_err "Merge strategy must be one of: squash, merge, rebase (got '$MERGE_STRATEGY')."
-        exit 1
-    fi
-fi
-
-if [ "$ENABLE_COMMITS" = true ]; then
-    if ! command -v git >/dev/null 2>&1; then
-        log_err "Git is required when commits are enabled."
-        exit 1
-    fi
-
-    if ! git rev-parse --git-dir >/dev/null 2>&1; then
-        log_err "Commits are enabled but this is not a git repository. Run inside a git repo or use --disable-commits."
-        exit 1
-    fi
-fi
-
-if ! command -v codex &> /dev/null; then
-    log_err "The 'codex' CLI is not installed or not in your PATH."
+if ! command -v codex >/dev/null 2>&1; then
+    log_err "The 'codex' CLI is required but not installed or not in PATH."
     exit 1
 fi
-
-if [ -e "$TARGET_FILE" ] && [ ! -w "$TARGET_FILE" ]; then
-    log_err "Target file '$TARGET_FILE' is not writable. Check permissions or sandbox settings."
-    exit 1
-fi
-
-# Optional git worktree handling
-if [ "$LIST_WORKTREES" = true ]; then
-    list_worktrees
-fi
-
-setup_worktree
-
-if command -v git >/dev/null 2>&1 && git rev-parse --git-dir >/dev/null 2>&1; then
-    MAIN_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main")
-fi
-
-# Ensure worktree cleanup on exit when requested
-trap cleanup_worktree EXIT
-
-# ------------------------------------------------------------------------------
-# MAIN LOOP
-# ------------------------------------------------------------------------------
 
 prepare_project_root
 log_info "Starting Researcher on '$TARGET_FILE'"
 
-START_TIME=$(date +%s)
-no_change_streak=0
+for ((i=1; i<=ITERATIONS; i++)); do
+    stage=$(select_stage_for_iteration "$i" "$ITERATIONS")
+    log_info "Iteration $i/$ITERATIONS -> stage '$stage'"
 
-i=1
-while [ "$i" -le "$MAX_ITERATIONS" ]; do
-    # Global stopping conditions checked at the top of each loop
-    if [ -n "$MAX_DURATION" ]; then
-        now=$(date +%s)
-        elapsed_now=$((now - START_TIME))
-        if [ "$elapsed_now" -ge "$MAX_DURATION" ]; then
-            log_warn "Max duration reached (${elapsed_now}s); stopping."
-            break
-        fi
+    if ! run_codex_iteration "$stage"; then
+        log_warn "Stage '$stage' failed. Stopping early."
+        break
     fi
 
-    if [ -n "$MAX_COST" ] && [ -n "$TOTAL_COST" ]; then
-        if awk "BEGIN {exit !($TOTAL_COST >= $MAX_COST)}"; then
-            log_warn "Max budget reached (\$$TOTAL_COST / \$$MAX_COST); stopping."
-            break
-        fi
+    if [ "$i" -lt "$ITERATIONS" ]; then
+        sleep "$DELAY"
     fi
 
-    iteration_display=$(get_iteration_display "$i" "$MAX_ITERATIONS")
-    branch_name=""
-
-    if [ "$ENABLE_COMMITS" = true ] && command -v git >/dev/null 2>&1 && git rev-parse --git-dir >/dev/null 2>&1; then
-        branch_name=$(create_iteration_branch "$iteration_display" "$i" 2>/dev/null || echo "")
-    fi
-
-    echo ""
-    log_info "--- Iteration $i / $MAX_ITERATIONS ---"
-
-    if [ "$DRY_RUN" = false ]; then
-        create_backup
-    fi
-
-    # Strategy Selector
-    CURRENT_INSTRUCTION=""
-
-    if [ $i -eq 1 ]; then
-        CURRENT_INSTRUCTION="$PROMPT_INIT"
-    elif [ $i -eq $MAX_ITERATIONS ]; then
-        CURRENT_INSTRUCTION="$PROMPT_POLISH"
-    elif (( i % 3 == 0 )); then
-        CURRENT_INSTRUCTION="$PROMPT_MATHEMATIZE"
-    elif (( i % 4 == 0 )); then
-        CURRENT_INSTRUCTION="$PROMPT_CRITIQUE"
-    else
-        CURRENT_INSTRUCTION="$PROMPT_EXPANSION"
-    fi
-
-    before_hash=""
-    if [ "$DRY_RUN" = false ]; then
-        before_hash=$(compute_target_hash || echo "")
-    fi
-
-    if run_codex_iteration "$CURRENT_INSTRUCTION"; then
-        SUCCESSFUL_ITERATIONS=$((SUCCESSFUL_ITERATIONS + 1))
-        ERROR_STREAK=0
-
-        if [ "$DRY_RUN" = false ]; then
-            after_hash=$(compute_target_hash || echo "")
-            if [ -n "$before_hash" ] && [ -n "$after_hash" ] && [ "$before_hash" = "$after_hash" ]; then
-                no_change_streak=$((no_change_streak + 1))
-                log_warn "No changes detected in '$TARGET_FILE' (streak: $no_change_streak)."
-                if [ "$no_change_streak" -ge "$NO_CHANGE_THRESHOLD" ]; then
-                    log_info "No changes in last $NO_CHANGE_THRESHOLD iterations, stopping early."
-                    break
-                fi
-            else
-                no_change_streak=0
-            fi
-        fi
-
-        if [ "$ENABLE_COMMITS" = true ] && [ -n "$branch_name" ] && [ -n "$MAIN_BRANCH" ]; then
-            if ! researcher_commit "$iteration_display" "$branch_name" "$MAIN_BRANCH"; then
-                log_warn "$iteration_display Git commit/PR step failed; continuing without aborting pipeline."
-            fi
-        fi
-
-        log_success "Update complete."
-    else
-        ERROR_STREAK=$((ERROR_STREAK + 1))
-        no_change_streak=0
-        log_warn "Iteration incomplete (consecutive failures: $ERROR_STREAK)."
-        if [ "$ERROR_STREAK" -ge 3 ]; then
-            log_err "Aborting after $ERROR_STREAK consecutive Codex failures."
-            break
-        fi
-    fi
-
-    if [ "$DRY_RUN" = false ]; then
-        sleep "$ITERATION_DELAY"
-    fi
-
-    ((i++))
 done
 
-END_TIME=$(date +%s)
-ELAPSED=$((END_TIME - START_TIME))
-
-echo ""
-log_success "Pipeline Finished."
-log_info "Successful iterations: $SUCCESSFUL_ITERATIONS (elapsed: ${ELAPSED}s)"
-log_info "Final manuscript: $TARGET_FILE"
+log_success "Researcher finished. Manuscript is '${TARGET_FILE}'."
