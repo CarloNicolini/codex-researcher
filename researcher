@@ -7,7 +7,7 @@ VERSION="2.4.0"
 TARGET_FILE="project.md"
 INSTRUCTION_FILE=""
 GOAL=""
-ITERATIONS=6
+ITERATIONS=2
 DELAY=2
 DRY_RUN=false
 MODEL_FLAG=""
@@ -328,13 +328,15 @@ run_codex_iteration() {
     fi
 
     log_info "Running stage '$stage'..."
-    local args=("-s" "$SANDBOX_MODE" "exec" "--full-auto")
+    local args=()
+    args+=("-s" "$SANDBOX_MODE")
     if [ -n "$APPROVAL_POLICY" ]; then
         args+=("-a" "$APPROVAL_POLICY")
     fi
     if [ -n "$MODEL_FLAG" ]; then
         args+=("-m" "$MODEL_FLAG")
     fi
+    args+=("exec" "--full-auto")
 
     if ! printf '%s' "$full_prompt" | codex "${args[@]}"; then
         log_err "Codex failed for stage '$stage'."
@@ -371,10 +373,10 @@ Required:
 Options:
   -f, --file <path>            Target Markdown file or directory (default: project.md)
   -i, --instructions <path>    Extra instructions read from a file
-  -n, --iterations <num>       Iterations to run (default: 6)
-  -d, --delay <seconds>        Delay between iterations (default: 2)
+  -n, --iterations <num>       Iterations to run (default: ${ITERATIONS})
+  -d, --delay <seconds>        Delay between iterations (default: ${DELAY})
   --notes-file <path>          Shared notes file (default: shared_task_notes.md)
-  --model <name>               Model flag passed to codex (e.g., o1)
+  --model <name>               Model flag passed to codex (e.g., gpt-5.1)
   -S, --sandbox <mode>         Sandbox policy (read-only, workspace-write, danger-full-access)
   -A, --approval <policy>      Approval policy (untrusted, on-failure, on-request, never)
   --dry-run                    Show prompts but do not call codex
