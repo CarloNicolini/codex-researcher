@@ -3,41 +3,115 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VERSION="2.4.0"
+VERSION="2.6.0"
 TARGET_FILE="project.md"
 INSTRUCTION_FILE=""
 GOAL=""
-ITERATIONS=2
+ITERATIONS=7
 DELAY=2
 DRY_RUN=false
+AI_BACKEND="opencode"
 MODEL_FLAG=""
 SANDBOX_MODE="workspace-write"
 APPROVAL_POLICY="on-failure"
 NOTES_FILE="shared_task_notes.md"
+OPENCODE_AGENT="build"
 PROJECT_TYPE="markdown"
 LATEX_MAIN=""
 LATEX_FILES=()
 LATEX_SEEN=""
 PATH_RESOLVER=""
+STAGE_PATHS=()
+STAGE_PATH_SEEN=""
 
 PROMPT_INIT="Generate a comprehensive outline and write the initial Abstract and Introduction based on the goal. Ensure standard academic structure."
-PROMPT_EXPANSION="Review the target file. Identify sections that are brief. Expand them with theoretical context and simulated citations. Identify and draft new sections that can make the paper better, correlated applications or further developments."
-PROMPT_MATHEMATIZE="Review the target file. Convert plain text logic into rigorous mathematical notation, formal definitions, and proofs."
-PROMPT_CRITIQUE="Act as 'Reviewer #2'. Harshly critique logic/flow in the target file. Remove redundancy and fix weak arguments."
+PROMPT_RESEARCH="Conduct an actual literature review using available tools (e.g., web search, scholarly APIs). Find real, highly-cited papers relevant to the manuscript. Synthesize these findings into the Related Work section. Create or update a 'biblio.bib' file with accurate BibLaTeX entries for all new citations."
+PROMPT_EXPANSION="Review the target file. Identify sections that are brief. Expand them with theoretical context and REAL citations (use tools to find them, do not simulate). Identify and draft new sections that can make the paper better, correlated applications or further developments."
+PROMPT_MATHEMATIZE="Review the target file. Convert plain text logic into rigorous mathematical notation, formal definitions, and proofs where appropriate."
+PROMPT_CRITIQUE="Act as 'Reviewer #2'. Harshly critique logic/flow in the target file. Remove redundancy, fix weak arguments, and identify claims lacking citations."
+PROMPT_CROSSREF="Ensure all citations are cross-referenced properly in the text using standard Pandoc Markdown syntax (e.g., [@smith2026]) matching the keys in 'biblio.bib'. Verify 'biblio.bib' adheres to OMMS guidelines (e.g., no % signs in DOIs, langid fields present)."
 PROMPT_POLISH="Final Polish. Check for academic tone, consistency, and formatting. Ensure structure: Abstract, Intro, Related Work, Methodology, Results, Conclusion."
 
 PROMPT_INIT_OVERRIDE=""
+PROMPT_RESEARCH_OVERRIDE=""
 PROMPT_EXPANSION_OVERRIDE=""
 PROMPT_MATHEMATIZE_OVERRIDE=""
 PROMPT_CRITIQUE_OVERRIDE=""
+PROMPT_CROSSREF_OVERRIDE=""
 PROMPT_POLISH_OVERRIDE=""
 
-SYSTEM_CONTEXT="You are a Senior Principal Researcher at a top-tier institute.\nYour goal is to transform the project rooted at '{TARGET_FILE}' into a rigorous research paper.\n- Strictly use LaTeX for math (e.g., $\\int f(x) dx$).\n- Use standard Markdown headers.\n- NO conversational filler. DO NOT say 'Here is the code'.\n- Maintain a concise status/notes file 'shared_task_notes.md' across iterations as instructed.\n- Do not output file contents to stdout unless requested.\n- When reviewing any section file, read and reason about its entire contents.\n- When working on a LaTeX project, inspect the main file's \\input/\\include graph and edit each referenced .tex file in place.\n- Avoid excessive markdown structure and prefer fluent textbook or research-paper English prose."
+SYSTEM_CONTEXT="You are a Senior Principal Researcher at a top-tier institute.\nYour goal is to transform the project rooted at '{TARGET_FILE}' into a rigorous research paper.\n- Strictly use LaTeX for math (e.g., $\\int f(x) dx$).\n- Preserve the manuscript format already in use by the target file: Markdown stays Markdown, LaTeX stays LaTeX.\n- NO conversational filler. DO NOT say 'Here is the code'.\n- Maintain a concise status/notes file 'shared_task_notes.md' across iterations as instructed.\n- Maintain a 'biblio.bib' file formatted as BibLaTeX. Use sentence case for titles with 'langid = {en}' to ensure correct formatting (per Open Manual of Markdown Style).\n- Do not output file contents to stdout unless requested.\n- When reviewing any section file, read and reason about its entire contents.\n- When working on a LaTeX project, inspect the main file's \\input/\\include graph and edit each referenced .tex file in place.\n- Avoid excessive markdown structure and prefer fluent research-paper English prose. \n- Avoid phrasings like 'the following section','we invite the readers' and everything that makes the prose cumbersome. Prefer very lean and direct academic writing as in scientific journals. \n- when necessary feel free to prune parts of the manuscript that are redundant or do not contribute to the main goal, say it in the shared notes though.\n- Always ensure that the manuscript flows logically and that each section builds upon the previous ones.\n- Use real citations by actively searching the literature using available tools. Never invent or hallucinate citations."
+
 
 log_info() { printf '[INFO] %s\n' "$1"; }
 log_warn() { printf '[WARN] %s\n' "$1"; }
 log_err() { printf '[ERROR] %s\n' "$1"; }
 log_success() { printf '[SUCCESS] %s\n' "$1"; }
+
+normalize_backend() {
+    case "$AI_BACKEND" in
+        claude-code) AI_BACKEND="claude" ;;
+    esac
+}
+
+backend_binary() {
+    case "$AI_BACKEND" in
+        opencode) printf 'opencode' ;;
+        codex) printf 'codex' ;;
+        claude) printf 'claude' ;;
+        *) return 1 ;;
+    esac
+}
+
+run_backend_prompt() {
+    local prompt="$1"
+    local mode="${2:-edit}"
+
+    case "$AI_BACKEND" in
+        opencode)
+            local args=("run")
+            if [ "$mode" = "readonly" ]; then
+                args+=("--agent" "plan")
+            elif [ -n "$OPENCODE_AGENT" ]; then
+                args+=("--agent" "$OPENCODE_AGENT")
+            fi
+            if [ -n "$MODEL_FLAG" ]; then
+                args+=("--model" "$MODEL_FLAG")
+            fi
+            opencode "${args[@]}" "$prompt"
+            ;;
+        codex)
+            local args=("-s" "$SANDBOX_MODE")
+            if [ -n "$APPROVAL_POLICY" ]; then
+                args+=("-a" "$APPROVAL_POLICY")
+            fi
+            if [ -n "$MODEL_FLAG" ]; then
+                args+=("-m" "$MODEL_FLAG")
+            fi
+            args+=("exec" "--full-auto")
+            if [ "$mode" = "readonly" ]; then
+                prompt="Read the prompt and respond in text only. Do not modify any files or run mutating commands.\n\n${prompt}"
+            fi
+            printf '%s' "$prompt" | codex "${args[@]}"
+            ;;
+        claude)
+            local args=("--bare" "-p" "$prompt")
+            if [ -n "$MODEL_FLAG" ]; then
+                args+=("--model" "$MODEL_FLAG")
+            fi
+            if [ "$mode" = "readonly" ]; then
+                args+=("--tools" "")
+            else
+                args+=("--allowedTools" "Bash,Read,Edit")
+            fi
+            claude "${args[@]}"
+            ;;
+        *)
+            log_err "Unsupported backend '$AI_BACKEND'."
+            return 1
+            ;;
+    esac
+}
 
 detect_path_resolver() {
     if command -v python3 >/dev/null 2>&1; then
@@ -76,16 +150,58 @@ PY
 detect_path_resolver
 
 split_markdown_into_sections() {
-    local source_file="$1"
-    local dest_dir="$2"
+    return 0
+}
 
-    if [ ! -f "$source_file" ]; then
-        return 1
+add_stage_path() {
+    local path="$1"
+    if [ -z "$path" ]; then
+        return 0
+    fi
+    if [ ! -e "$path" ] && ! git ls-files --error-unmatch -- "$path" >/dev/null 2>&1; then
+        return 0
+    fi
+    if printf '%s\n' "$STAGE_PATH_SEEN" | grep -Fxq "$path"; then
+        return 0
+    fi
+    STAGE_PATH_SEEN="${STAGE_PATH_SEEN}${path}"$'\n'
+    STAGE_PATHS+=("$path")
+}
+
+add_bib_files_in_dir() {
+    local dir="$1"
+    if [ -z "$dir" ] || [ ! -d "$dir" ]; then
+        return 0
     fi
 
-    mkdir -p "$dest_dir"
+    local nullglob_state
+    nullglob_state=$(shopt -p nullglob || true)
+    shopt -s nullglob
 
-    awk -v outdir="$dest_dir" '\n    function open_section(raw_title) {\n        section++\n        slug = raw_title\n        gsub(/^[#[:space:]]+/, "", slug)\n        gsub(/[^A-Za-z0-9]+/, "_", slug)\n        gsub(/^_+|_+$/, "", slug)\n        if (slug == "") slug = "section"\n        filename = sprintf("%s/%d_%s.md", outdir, section, tolower(slug))\n        close(current)\n        current = filename\n        print "" > current\n    }\n    BEGIN { section = 0; current = "" }\n    {\n        if ($0 ~ /^# /) {\n            open_section($0)\n        } else if (section == 0) {\n            open_section("section")\n        }\n        print $0 >> current\n    }\n    END {\n        if (section == 0) {\n            current = sprintf("%s/1_section.md", outdir)\n            print "" > current\n        }\n    }\n    ' "$source_file"
+    local bib_file
+    for bib_file in "$dir"/*.bib; do
+        add_stage_path "$bib_file"
+    done
+
+    eval "$nullglob_state"
+}
+
+collect_stage_paths() {
+    STAGE_PATHS=()
+    STAGE_PATH_SEEN=""
+
+    if [ "$PROJECT_TYPE" = "latex" ]; then
+        local latex_file
+        for latex_file in "${LATEX_FILES[@]}"; do
+            add_stage_path "$latex_file"
+            add_bib_files_in_dir "$(dirname "$latex_file")"
+        done
+    else
+        add_stage_path "$TARGET_FILE"
+        add_bib_files_in_dir "$(dirname "$TARGET_FILE")"
+    fi
+
+    add_stage_path "$NOTES_FILE"
 }
 
 collect_latex_files() {
@@ -147,13 +263,8 @@ EOF
 
 prepare_project_root() {
     if [ -d "$TARGET_FILE" ]; then
-        PROJECT_TYPE="markdown"
-        if ! find "$TARGET_FILE" -maxdepth 1 -type f -name "*.md" | grep -q .; then
-            local first_section="$TARGET_FILE/1_introduction.md"
-            log_warn "No markdown sections found in '$TARGET_FILE'. Creating placeholder '$first_section'."
-            printf '# Research Project\n\nGoal: %s\n' "$GOAL" > "$first_section"
-        fi
-        return 0
+        log_err "Target '$TARGET_FILE' is a directory. Please specify a file instead (e.g., project.md or project.tex)."
+        exit 1
     fi
 
     if [[ "$TARGET_FILE" == *.tex ]]; then
@@ -173,30 +284,20 @@ prepare_project_root() {
     fi
 
     PROJECT_TYPE="markdown"
-    local base_dir
-    base_dir=$(dirname "$TARGET_FILE")
-    local base_name
-    base_name=$(basename "$TARGET_FILE")
-    local name_no_ext
-    name_no_ext="${base_name%.*}"
-    local project_dir
-    project_dir="${base_dir}/${name_no_ext}"
-
-    if [ ! -d "$project_dir" ]; then
-        mkdir -p "$project_dir"
-        if [ -f "$TARGET_FILE" ]; then
-            log_info "Initializing '$project_dir' from '$TARGET_FILE'."
-            split_markdown_into_sections "$TARGET_FILE" "$project_dir"
-        else
-            local first_section="$project_dir/1_introduction.md"
-            log_warn "Target '$TARGET_FILE' missing. Creating placeholder '$first_section'."
-            printf '# Research Project\n\nGoal: %s\n' "$GOAL" > "$first_section"
-        fi
+    # We no longer split into sections. We keep it as a single file.
+    if [ ! -f "$TARGET_FILE" ]; then
+        log_warn "Target '$TARGET_FILE' missing. Creating placeholder."
+        printf '# Research Project\n\nGoal: %s\n' "$GOAL" > "$TARGET_FILE"
     else
-        log_info "Using existing project directory '$project_dir'."
+        log_info "Using existing file '$TARGET_FILE'."
     fi
+}
 
-    TARGET_FILE="$project_dir"
+ensure_clean_worktree() {
+    if [ -n "$(git status --porcelain --untracked-files=normal)" ]; then
+        log_err "Git worktree is not clean. Commit, stash, or remove local changes before running researcher."
+        exit 1
+    fi
 }
 
 apply_prompt_override() {
@@ -204,9 +305,11 @@ apply_prompt_override() {
     local content="$2"
     case "$stage" in
         init) PROMPT_INIT_OVERRIDE="$content" ;;
+        research) PROMPT_RESEARCH_OVERRIDE="$content" ;;
         expansion) PROMPT_EXPANSION_OVERRIDE="$content" ;;
         mathematize) PROMPT_MATHEMATIZE_OVERRIDE="$content" ;;
         critique) PROMPT_CRITIQUE_OVERRIDE="$content" ;;
+        crossref) PROMPT_CROSSREF_OVERRIDE="$content" ;;
         polish) PROMPT_POLISH_OVERRIDE="$content" ;;
         *) log_err "Unknown prompt stage: $stage"; exit 1 ;;
     esac
@@ -250,9 +353,11 @@ get_prompt_for_stage() {
     local stage="$1"
     case "$stage" in
         init) printf '%s' "${PROMPT_INIT_OVERRIDE:-$PROMPT_INIT}" ;;
+        research) printf '%s' "${PROMPT_RESEARCH_OVERRIDE:-$PROMPT_RESEARCH}" ;;
         expansion) printf '%s' "${PROMPT_EXPANSION_OVERRIDE:-$PROMPT_EXPANSION}" ;;
         mathematize) printf '%s' "${PROMPT_MATHEMATIZE_OVERRIDE:-$PROMPT_MATHEMATIZE}" ;;
         critique) printf '%s' "${PROMPT_CRITIQUE_OVERRIDE:-$PROMPT_CRITIQUE}" ;;
+        crossref) printf '%s' "${PROMPT_CROSSREF_OVERRIDE:-$PROMPT_CROSSREF}" ;;
         polish) printf '%s' "${PROMPT_POLISH_OVERRIDE:-$PROMPT_POLISH}" ;;
         *) log_err "Unsupported stage: $stage"; exit 1 ;;
     esac
@@ -299,7 +404,7 @@ build_full_prompt() {
     fi
     local layout_desc=""
     if [ "$PROJECT_TYPE" = "latex" ]; then
-        layout_desc="PROJECT LAYOUT:\n- Type: LaTeX\n- Main file (resolved): $LATEX_MAIN\n- Included .tex files:"
+        layout_desc="PROJECT LAYOUT:\n- Type: LaTeX\n- Main file (resolved): $LATEX_MAIN\n- Citation style: keep LaTeX citations such as \\cite{key}; never use Markdown citations like [@key].\n- Bibliography: maintain references in biblio.bib and keep the manuscript fully in LaTeX syntax.\n- Included .tex files:"
         for file in "${LATEX_FILES[@]}"; do
             if [ "$file" = "$LATEX_MAIN" ]; then
                 layout_desc+="\n  * $file (main)"
@@ -309,7 +414,7 @@ build_full_prompt() {
         done
         layout_desc+="\n- Edit these files directly and keep the include hierarchy intact.\n"
     else
-        layout_desc="PROJECT LAYOUT:\n- Type: Markdown\n- Root directory: $TARGET_FILE\n- Each numbered Markdown section file (e.g., 1_introduction.md) is the source of truth; edit them in place.\n"
+        layout_desc="PROJECT LAYOUT:\n- Type: Markdown\n- File: $TARGET_FILE\n- Citation style: use Pandoc Markdown citations such as [@citekey] or [@citekey1; @citekey2].\n- Include a YAML metadata block with 'bibliography: biblio.bib' at the top when appropriate.\n- Edit this file directly.\n"
     fi
     prompt+="$layout_desc\n"
     prompt+="\nCURRENT TASK: $stage_prompt\n"
@@ -318,30 +423,43 @@ build_full_prompt() {
 
 run_codex_iteration() {
     local stage="$1"
+    local iteration="$2"
     local full_prompt
     full_prompt=$(build_full_prompt "$stage")
 
     if [ "$DRY_RUN" = true ]; then
-        log_info "DRY RUN: would execute stage '$stage' with prompt:"
+        log_info "DRY RUN: would execute stage '$stage' (iter $iteration) with prompt:"
         printf '-----\n%s\n-----\n' "$full_prompt"
         return 0
     fi
 
-    log_info "Running stage '$stage'..."
-    local args=()
-    args+=("-s" "$SANDBOX_MODE")
-    if [ -n "$APPROVAL_POLICY" ]; then
-        args+=("-a" "$APPROVAL_POLICY")
-    fi
-    if [ -n "$MODEL_FLAG" ]; then
-        args+=("-m" "$MODEL_FLAG")
-    fi
-    args+=("exec" "--full-auto")
+    log_info "Running stage '$stage' (iteration $iteration) with backend '$AI_BACKEND'..."
 
-    if ! printf '%s' "$full_prompt" | codex "${args[@]}"; then
-        log_err "Codex failed for stage '$stage'."
+    if ! run_backend_prompt "$full_prompt" "edit"; then
+        log_err "Backend '$AI_BACKEND' failed for stage '$stage'."
         return 1
     fi
+
+    if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        collect_stage_paths
+        if [ "${#STAGE_PATHS[@]}" -gt 0 ]; then
+            if ! git add -- "${STAGE_PATHS[@]}" >/dev/null 2>&1; then
+                log_err "git add failed for stage '$stage'."
+                return 1
+            fi
+        fi
+        if ! git diff --cached --quiet; then
+            if git commit -m "researcher: stage '$stage' complete (iteration $iteration)" >/dev/null; then
+                log_info "Committed changes for stage '$stage'."
+            else
+                log_err "git commit failed for stage '$stage'."
+                return 1
+            fi
+        else
+            log_info "No changes to commit for stage '$stage'."
+        fi
+    fi
+
     return 0
 }
 
@@ -350,12 +468,16 @@ select_stage_for_iteration() {
     local total="$2"
     if [ "$iteration" -eq 1 ]; then
         printf 'init'
+    elif [ "$iteration" -eq 2 ] && [ "$total" -ge 4 ]; then
+        printf 'research'
+    elif [ "$iteration" -eq $((total - 1)) ] && [ "$total" -ge 3 ]; then
+        printf 'crossref'
     elif [ "$iteration" -eq "$total" ]; then
         printf 'polish'
-    elif (( iteration % 3 == 0 )); then
-        printf 'mathematize'
     elif (( iteration % 4 == 0 )); then
         printf 'critique'
+    elif (( iteration % 3 == 0 )); then
+        printf 'mathematize'
     else
         printf 'expansion'
     fi
@@ -363,7 +485,7 @@ select_stage_for_iteration() {
 
 show_help() {
     cat <<EOF
-Codex Researcher (v$VERSION)
+Researcher (v$VERSION)
 
 Usage: $0 --goal <text> [options]
 
@@ -371,16 +493,18 @@ Required:
   -g, --goal <text>            Research goal (unless --instructions is used)
 
 Options:
-  -f, --file <path>            Target Markdown file or directory (default: project.md)
+  -f, --file <path>            Target Markdown or LaTeX file (default: project.md)
   -i, --instructions <path>    Extra instructions read from a file
+  -b, --backend <name>         AI backend: opencode, codex, claude, claude-code (default: ${AI_BACKEND})
   -n, --iterations <num>       Iterations to run (default: ${ITERATIONS})
   -d, --delay <seconds>        Delay between iterations (default: ${DELAY})
   --notes-file <path>          Shared notes file (default: shared_task_notes.md)
-  --model <name>               Model flag passed to codex (e.g., gpt-5.1)
+  --model <name>               Backend-specific model id (e.g., openrouter/anthropic/claude-sonnet-4)
+  --opencode-agent <name>      OpenCode primary agent for edit passes (default: ${OPENCODE_AGENT})
   -S, --sandbox <mode>         Sandbox policy (read-only, workspace-write, danger-full-access)
   -A, --approval <policy>      Approval policy (untrusted, on-failure, on-request, never)
-  --dry-run                    Show prompts but do not call codex
-  --prompt <stage>:<text>      Override a stage prompt inline (stage: init|expansion|mathematize|critique|polish)
+  --dry-run                    Show prompts but do not call the backend
+  --prompt <stage>:<text>      Override a stage prompt inline (stage: init|research|expansion|mathematize|critique|crossref|polish)
   --prompt-file <stage>:<path> Override a stage prompt using the contents of a file
   -h, --help                   Show this message
 EOF
@@ -395,6 +519,9 @@ while [[ $# -gt 0 ]]; do
         -f|--file)
             if [[ $# -lt 2 ]]; then log_err "Missing value for $1"; exit 1; fi
             TARGET_FILE="$2"; shift 2 ;; 
+        -b|--backend)
+            if [[ $# -lt 2 ]]; then log_err "Missing value for $1"; exit 1; fi
+            AI_BACKEND="$2"; shift 2 ;;
         -i|--instructions)
             if [[ $# -lt 2 ]]; then log_err "Missing value for $1"; exit 1; fi
             INSTRUCTION_FILE="$2"; shift 2 ;; 
@@ -412,6 +539,9 @@ while [[ $# -gt 0 ]]; do
         --model)
             if [[ $# -lt 2 ]]; then log_err "Missing value for $1"; exit 1; fi
             MODEL_FLAG="$2"; shift 2 ;; 
+        --opencode-agent)
+            if [[ $# -lt 2 ]]; then log_err "Missing value for $1"; exit 1; fi
+            OPENCODE_AGENT="$2"; shift 2 ;;
         -S|--sandbox)
             if [[ $# -lt 2 ]]; then log_err "Missing value for $1"; exit 1; fi
             SANDBOX_MODE="$2"; shift 2 ;; 
@@ -451,6 +581,12 @@ if ! [[ "$DELAY" =~ ^[0-9]+$ ]] || [ "$DELAY" -lt 0 ]; then
     exit 1
 fi
 
+normalize_backend
+
+case "$AI_BACKEND" in
+    opencode|codex|claude) ;;
+    *) log_err "Backend must be opencode, codex, claude, or claude-code."; exit 1 ;;
+esac
 case "$SANDBOX_MODE" in
     read-only|workspace-write|danger-full-access) ;; 
     *) log_err "Sandbox mode must be read-only, workspace-write, or danger-full-access."; exit 1 ;; 
@@ -460,10 +596,24 @@ case "$APPROVAL_POLICY" in
     *) log_err "Approval policy must be untrusted, on-failure, on-request, or never."; exit 1 ;; 
 esac
 
-if ! command -v codex >/dev/null 2>&1; then
-    log_err "The 'codex' CLI is required but not installed or not in PATH."
+BACKEND_BIN=$(backend_binary) || {
+    log_err "Could not resolve backend binary for '$AI_BACKEND'."
+    exit 1
+}
+
+if ! command -v "$BACKEND_BIN" >/dev/null 2>&1; then
+    log_err "The '$BACKEND_BIN' CLI is required for backend '$AI_BACKEND' but is not installed or not in PATH."
     exit 1
 fi
+
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    log_err "This script must be run from within a git repository. Please run 'git init' first."
+    exit 1
+fi
+
+ensure_clean_worktree
+
+START_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo "empty")
 
 prepare_project_root
 log_info "Starting Researcher on '$TARGET_FILE'"
@@ -472,7 +622,7 @@ for ((i=1; i<=ITERATIONS; i++)); do
     stage=$(select_stage_for_iteration "$i" "$ITERATIONS")
     log_info "Iteration $i/$ITERATIONS -> stage '$stage'"
 
-    if ! run_codex_iteration "$stage"; then
+    if ! run_codex_iteration "$stage" "$i"; then
         log_warn "Stage '$stage' failed. Stopping early."
         break
     fi
@@ -483,4 +633,52 @@ for ((i=1; i<=ITERATIONS; i++)); do
 
 done
 
+END_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo "empty")
+
 log_success "Researcher finished. Manuscript is '${TARGET_FILE}'."
+
+count_manuscript_lines() {
+    if [ "$PROJECT_TYPE" = "markdown" ]; then
+        if [ -f "$TARGET_FILE" ]; then
+            wc -l < "$TARGET_FILE" | tr -d ' '
+        else
+            printf '0'
+        fi
+        return 0
+    fi
+
+    local total=0
+    local file
+    local lines
+    for file in "${LATEX_FILES[@]}"; do
+        if [ ! -f "$file" ]; then
+            continue
+        fi
+        lines=$(wc -l < "$file" | tr -d ' ')
+        total=$((total + lines))
+    done
+    printf '%s' "$total"
+}
+
+if [ "$START_COMMIT" != "$END_COMMIT" ] && [ "$END_COMMIT" != "empty" ]; then
+    log_info "=== Version History ==="
+    if [ "$START_COMMIT" = "empty" ]; then
+        git log --oneline
+        DIFF_CMD="git show HEAD"
+    else
+        git log --oneline ${START_COMMIT}..HEAD
+        DIFF_CMD="git diff ${START_COMMIT}..HEAD"
+    fi
+    echo ""
+    
+    TOTAL_LINES=$(count_manuscript_lines)
+
+    log_info "Analyzing improvements..."
+    SUMMARY_PROMPT="Analyze the following git diff and summarize in exactly one line how the manuscript improved. Begin your response directly with the summary. State explicitly that 'The new manuscript now has ${TOTAL_LINES} lines.'"
+
+    if SUMMARY=$(run_backend_prompt "$(printf "%s\n\n%s" "$SUMMARY_PROMPT" "$(eval "$DIFF_CMD")")" "readonly"); then
+        log_success "Final Status: $SUMMARY"
+    else
+        log_warn "Could not generate final summary automatically."
+    fi
+fi
