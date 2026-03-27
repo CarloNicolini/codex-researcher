@@ -21,16 +21,18 @@ LATEX_MAIN=""
 LATEX_FILES=()
 LATEX_SEEN=""
 PATH_RESOLVER=""
+GIT_ROOT=""
+SKILL_FILE=""
 STAGE_PATHS=()
 STAGE_PATH_SEEN=""
 
-PROMPT_INIT="Generate a comprehensive outline and write the initial Abstract and Introduction based on the goal. Ensure standard academic structure."
-PROMPT_RESEARCH="Conduct an actual literature review using available tools (e.g., web search, scholarly APIs). Find real, highly-cited papers relevant to the manuscript. Synthesize these findings into the Related Work section. Create or update a 'biblio.bib' file with accurate BibLaTeX entries for all new citations."
-PROMPT_EXPANSION="Review the target file. Identify sections that are brief. Expand them with theoretical context and REAL citations (use tools to find them, do not simulate). Identify and draft new sections that can make the paper better, correlated applications or further developments."
-PROMPT_MATHEMATIZE="Review the target file. Convert plain text logic into rigorous mathematical notation, formal definitions, and proofs where appropriate."
-PROMPT_CRITIQUE="Act as 'Reviewer #2'. Harshly critique logic/flow in the target file. Remove redundancy, fix weak arguments, and identify claims lacking citations."
-PROMPT_CROSSREF="Ensure all citations are cross-referenced properly in the text using standard Pandoc Markdown syntax (e.g., [@smith2026]) matching the keys in 'biblio.bib'. Verify 'biblio.bib' adheres to OMMS guidelines (e.g., no % signs in DOIs, langid fields present)."
-PROMPT_POLISH="Final Polish. Check for academic tone, consistency, and formatting. Ensure structure: Abstract, Intro, Related Work, Methodology, Results, Conclusion."
+PROMPT_INIT="Generate a strong initial manuscript from the goal, not a minimal stub. Produce a concrete research direction, a substantial outline, and a serious first draft of the opening material. If the topic warrants it, add additional sections immediately rather than waiting for later iterations."
+PROMPT_RESEARCH="Conduct an actual literature review using available tools (e.g., web search, scholarly APIs). Find real, highly-cited papers relevant to the manuscript. Substantially revise the manuscript in light of the literature: add missing concepts, replace weak claims, rewrite sections whose framing is poor, and create or update 'biblio.bib' with accurate BibLaTeX entries for all new citations."
+PROMPT_EXPANSION="Make the manuscript materially stronger, not just slightly longer. Review the whole file, identify thin arguments, missing sections, weak transitions, underdeveloped methodology, and unsupported claims. Rewrite aggressively where needed, add REAL citations, add or remove sections, and improve the paper toward publication quality."
+PROMPT_MATHEMATIZE="Review the whole manuscript and make substantial formal improvements. Convert vague logic into rigorous mathematical notation, formal definitions, derivations, assumptions, propositions, proofs, or algorithmic statements where appropriate. Rewrite surrounding prose as needed so the formalization is fully integrated."
+PROMPT_CRITIQUE="Act as 'Reviewer #2' and then fix the paper accordingly. Harshly critique logic, novelty, structure, evidential support, and flow. Remove redundancy, rewrite weak passages, tighten claims, add missing caveats, and identify then repair claims lacking citations."
+PROMPT_CROSSREF="Ensure citations and references are fully consistent throughout the manuscript. Add missing citations where needed, normalize citation usage across the whole document, remove orphan references, and verify 'biblio.bib' adheres to OMMS guidelines (e.g., no % signs in DOIs, langid fields present)."
+PROMPT_POLISH="Perform a decisive final upgrade pass, not just cosmetic editing. Rewrite awkward passages, improve section order if needed, tighten the abstract and introduction, ensure publication-level coherence, and leave the manuscript in its strongest overall form."
 
 PROMPT_INIT_OVERRIDE=""
 PROMPT_RESEARCH_OVERRIDE=""
@@ -41,6 +43,7 @@ PROMPT_CROSSREF_OVERRIDE=""
 PROMPT_POLISH_OVERRIDE=""
 
 SYSTEM_CONTEXT="You are a Senior Principal Researcher at a top-tier institute.\nYour goal is to transform the project rooted at '{TARGET_FILE}' into a rigorous research paper.\n- Strictly use LaTeX for math (e.g., $\\int f(x) dx$).\n- Preserve the manuscript format already in use by the target file: Markdown stays Markdown, LaTeX stays LaTeX.\n- NO conversational filler. DO NOT say 'Here is the code'.\n- Maintain a concise status/notes file 'shared_task_notes.md' across iterations as instructed.\n- Maintain a 'biblio.bib' file formatted as BibLaTeX. Use sentence case for titles with 'langid = {en}' to ensure correct formatting (per Open Manual of Markdown Style).\n- Do not output file contents to stdout unless requested.\n- When reviewing any section file, read and reason about its entire contents.\n- When working on a LaTeX project, inspect the main file's \\input/\\include graph and edit each referenced .tex file in place.\n- Avoid excessive markdown structure and prefer fluent research-paper English prose. \n- Avoid phrasings like 'the following section','we invite the readers' and everything that makes the prose cumbersome. Prefer very lean and direct academic writing as in scientific journals. \n- when necessary feel free to prune parts of the manuscript that are redundant or do not contribute to the main goal, say it in the shared notes though.\n- Always ensure that the manuscript flows logically and that each section builds upon the previous ones.\n- Use real citations by actively searching the literature using available tools. Never invent or hallucinate citations."
+SYSTEM_CONTEXT="You are a Senior Principal Researcher at a top-tier institute.\nYour goal is to transform the project rooted at '{TARGET_FILE}' into a rigorous research paper.\n- Strictly use LaTeX for math (e.g., $\\int f(x) dx$).\n- Preserve the manuscript format already in use by the target file: Markdown stays Markdown, LaTeX stays LaTeX.\n- NO conversational filler. DO NOT say 'Here is the code'.\n- Maintain a concise status/notes file 'shared_task_notes.md' across iterations as instructed.\n- Maintain a 'biblio.bib' file formatted as BibLaTeX. Use sentence case for titles with 'langid = {en}' to ensure correct formatting (per Open Manual of Markdown Style).\n- Do not output file contents to stdout unless requested.\n- When reviewing any section file, read and reason about its entire contents.\n- When working on a LaTeX project, inspect the main file's \\input/\\include graph and edit each referenced .tex file in place.\n- Avoid excessive markdown structure and prefer fluent research-paper English prose. \n- Avoid phrasings like 'the following section','we invite the readers' and everything that makes the prose cumbersome. Prefer very lean and direct academic writing as in scientific journals. \n- When necessary, feel free to prune parts of the manuscript that are redundant or do not contribute to the main goal; note this in the shared notes.\n- Always ensure that the manuscript flows logically and that each section builds upon the previous ones.\n- Use real citations by actively searching the literature using available tools. Never invent or hallucinate citations.\n- You are explicitly allowed to make large, ambitious edits when they improve the paper: rewrite entire sections, reorder the structure, add new sections, remove weak material, strengthen claims, and substantially expand the manuscript.\n- Do not be conservative. Prefer the strongest manuscript you can produce over minimal edits.\n- In every iteration, try to leave the manuscript materially better than before. If only small edits seem possible, search harder for deeper conceptual, structural, evidential, or expository improvements and make them."
 
 
 log_info() { printf '[INFO] %s\n' "$1"; }
@@ -204,6 +207,40 @@ collect_stage_paths() {
     add_stage_path "$NOTES_FILE"
 }
 
+discover_skill_file() {
+    local candidates=()
+    local target_dir=""
+
+    if [ -n "$TARGET_FILE" ]; then
+        target_dir=$(dirname "$TARGET_FILE")
+        candidates+=("$target_dir/SKILL.md" "$target_dir/SKILLS.md")
+    fi
+
+    if [ -n "$GIT_ROOT" ]; then
+        candidates+=("$GIT_ROOT/SKILL.md" "$GIT_ROOT/SKILLS.md")
+    fi
+
+    candidates+=("./SKILL.md" "./SKILLS.md")
+
+    local candidate
+    for candidate in "${candidates[@]}"; do
+        if [ -f "$candidate" ]; then
+            SKILL_FILE=$(normalize_path "$candidate")
+            return 0
+        fi
+    done
+
+    SKILL_FILE=""
+}
+
+read_skill_file() {
+    if [ -n "$SKILL_FILE" ] && [ -f "$SKILL_FILE" ]; then
+        cat "$SKILL_FILE"
+    else
+        printf ''
+    fi
+}
+
 collect_latex_files() {
     local file="$1"
     if [ -z "$file" ]; then
@@ -294,8 +331,8 @@ prepare_project_root() {
 }
 
 ensure_clean_worktree() {
-    if [ -n "$(git status --porcelain --untracked-files=normal)" ]; then
-        log_err "Git worktree is not clean. Commit, stash, or remove local changes before running researcher."
+    if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+        log_err "Git worktree has tracked changes. Commit or stash tracked modifications before running researcher. Untracked files are ignored."
         exit 1
     fi
 }
@@ -383,6 +420,8 @@ build_full_prompt() {
 
     local notes_content
     notes_content=$(read_notes_file)
+    local skill_content
+    skill_content=$(read_skill_file)
     local notes_instruction=""
     if [ -n "$NOTES_FILE" ]; then
         if [ -f "$NOTES_FILE" ]; then
@@ -398,6 +437,9 @@ build_full_prompt() {
     fi
     if [ -n "$notes_content" ]; then
         prompt+="\nPREVIOUS NOTES:\n$notes_content\n"
+    fi
+    if [ -n "$skill_content" ]; then
+        prompt+="\nPROJECT SKILL GUIDANCE:\nA project-local skill file was found at '$SKILL_FILE'. Treat it as authoritative guidance for workflow and actively apply it. In particular, use it to drive literature search strategy, source discovery, bibliography construction, and manuscript-improvement decisions.\n\n$skill_content\n"
     fi
     if [ -n "$notes_instruction" ]; then
         prompt+="\n$notes_instruction\n"
@@ -611,11 +653,14 @@ if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     exit 1
 fi
 
+GIT_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+
 ensure_clean_worktree
 
 START_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo "empty")
 
 prepare_project_root
+discover_skill_file
 log_info "Starting Researcher on '$TARGET_FILE'"
 
 for ((i=1; i<=ITERATIONS; i++)); do
